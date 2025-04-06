@@ -96,7 +96,7 @@ class GeminiMCPAgent:
     def _parse_tool_call(self, text):
         """Parse tool name and arguments from response text."""
         # Look for tool calls in the format: TOOL: name(arg1=value1, arg2=value2)
-        match = re.search(r'TOOL:\s*(\w+)\s*\((.*?)\)', text)
+        match = re.search(r'TOOL:\s*([\w-]+)\s*\((.*?)\)', text)
         if not match:
             print("Unable to parse tool call from response text.")
             return None, None
@@ -221,8 +221,8 @@ async def main():
     
     # Set up server parameters
     server_params = StdioServerParameters(
-        command=".venv/bin/python",
-        args=["pinta_mcp_server.py"]
+        command="./gmail-mcp-server/.venv/bin/python",
+        args=["./gmail-mcp-server/src/gmail/server.py", "--creds-file-path", "./gmail-mcp-server/gmail_key.json", "--token-path", "./gmail-mcp-server/token.json"]
     )
     
     try:

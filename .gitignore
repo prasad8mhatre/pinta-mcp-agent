@@ -10,3 +10,5 @@ wheels/
 .venv
 
 .env
+gmail_key.json
+token.json
