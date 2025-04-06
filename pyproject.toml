@@ -1,0 +1,19 @@
+[project]
+name = "pinta-mcp-server"
+version = "0.1.0"
+description = "Weather MCP Server"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "mcp-server",
+    "httpx",
+    "mcp[cli]>=1.6.0",
+    "pyautogui>=0.9.53",
+    "google-generativeai",
+    "mcp-client",
+    "python-dotenv",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
