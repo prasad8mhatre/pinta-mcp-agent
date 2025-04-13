@@ -9,6 +9,25 @@ from concurrent.futures import TimeoutError
 from functools import partial
 import json
 import re
+import logging
+
+# Set up logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Create file handler
+file_handler = logging.FileHandler('output.txt')
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+
+# Create console handler
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+
+# Add handlers to logger
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
 
 # Load environment variables
 load_dotenv()
@@ -24,25 +43,107 @@ async def generate_with_timeout(client, prompt, timeout=10):
     """Generate content with a timeout using Gemini"""
     try:
         loop = asyncio.get_event_loop()
+        
+        # Add explicit JSON structure request
+        prompt += "\n\nYou MUST respond with a valid JSON object in one of these two formats:\n"
+        prompt += '''For tool calls:
+{
+    "type": "tool_call",
+    "tool": {
+        "name": "tool_name",
+        "parameters": {
+            "param1": "value1"
+        }
+    },
+    "reasoning": "explanation"
+}
+
+For final answers:
+{
+    "type": "final_answer",
+    "response": "your response here",
+    "reasoning": "explanation"
+}'''
+        
         response = await asyncio.wait_for(
             loop.run_in_executor(
                 None, 
                 lambda: client.models.generate_content(
-                    model="gemini-2.0-flash",
-                    contents=prompt
+                    model= "gemini-2.0-flash",
+                    contents=[prompt]
                 )
             ),
             timeout=timeout
         )
         return response
     except TimeoutError:
-        print("LLM generation timed out!")
+        logger.error("LLM generation timed out!")
         raise
     except Exception as e:
-        print(f"Error in LLM generation: {e}")
+        logger.error(f"Error in LLM generation: {e}")
         raise
 
 class GeminiMCPAgent:
+    # Context prompt with all necessary checks
+    CONTEXT_PROMPT = '''You are an AI assistant that helps users with drawing tasks using Pinta tools.
+
+Your task is to:
+1. Understand the user's drawing request
+2. Break it down into simple steps taking screen resolution into account and draw in center of screen
+3. Use available tools to execute each step
+4. Verify the results
+5. Provide clear feedback
+
+Important Guidelines:
+- Always use the get_screen_size() tool first to determine screen dimensions
+- Center drawings by calculating coordinates based on screen size
+- Keep drawings proportional to screen size
+- Use appropriate tool parameters for screen scale
+- Perform self-checks at each step
+- Tag reasoning types (arithmetic, logic, lookup)
+- Handle uncertainties gracefully
+
+Self-Check Protocol:
+1. Before each action:
+   - Verify screen dimensions match previous measurements
+   - Confirm coordinates are within bounds
+   - Check tool parameters are valid
+2. After each action:
+   - Verify tool execution was successful
+   - Confirm results match expectations
+   - Check for any errors or exceptions
+
+Reasoning Type Tags:
+- Use [ARITHMETIC] for calculations (coordinates, dimensions)
+- Use [LOGIC] for decision making (tool selection, parameter validation)
+- Use [LOOKUP] for tool information and capabilities
+
+Fallback Procedures:
+1. If tool fails:
+   - Try alternative tools
+   - Adjust parameters
+   - Request user clarification
+2. If calculation fails:
+   - Use default safe values
+   - Scale down the drawing
+   - Center the drawing
+3. If uncertain:
+   - Ask for user confirmation
+   - Provide multiple options
+   - Suggest simpler alternatives
+
+Available Tools:
+{tools_description}
+
+When responding:
+1. For using a tool: Return a JSON with "type": "tool_call"
+2. For final answers: Return a JSON with "type": "final_answer"
+3. Always include your reasoning with type tags
+4. Keep responses concise and focused
+5. Include self-check results
+6. Suggest fallbacks if needed
+'''
+
     def __init__(self):
         """Initialize the Gemini-powered MCP agent."""
         self.tools = []
@@ -94,37 +195,75 @@ class GeminiMCPAgent:
             await self._client.__aexit__(None, None, None)
 
     def _parse_tool_call(self, text):
-        """Parse tool name and arguments from response text."""
-        # Look for tool calls in the format: TOOL: name(arg1=value1, arg2=value2)
-        match = re.search(r'TOOL:\s*(\w+)\s*\((.*?)\)', text)
-        if not match:
-            print("Unable to parse tool call from response text.")
+        """Parse tool name and arguments from response text.
+        
+        Args:
+            text (str): Raw response text from the LLM
+            
+        Returns:
+            tuple: (tool_name, arguments) or ("FINAL_ANSWER", response_text)
+            None: If parsing fails
+        """
+        try:
+            # Clean the text by removing leading/trailing whitespace and any markdown code block markers
+            cleaned_text = text.strip()
+            cleaned_text = re.sub(r'^```json\s*|\s*```$', '', cleaned_text, flags=re.MULTILINE)
+            
+            # Try to parse the JSON response
+            try:
+                response = json.loads(cleaned_text)
+            except json.JSONDecodeError as e:
+                # Try to extract JSON from the text if it's wrapped in other text
+                json_match = re.search(r'\{.*?\}', cleaned_text, re.DOTALL)
+                if json_match:
+                    try:
+                        response = json.loads(json_match.group(0))
+                    except json.JSONDecodeError:
+                        raise ValueError(f"Failed to parse JSON response: {e}\nRaw text: {repr(cleaned_text)}")
+                else:
+                    raise ValueError(f"Failed to parse JSON response: {e}\nRaw text: {repr(cleaned_text)}")
+            
+            # Validate response structure
+            if not isinstance(response, dict):
+                raise ValueError(f"Response is not a dictionary: {repr(response)}")
+            
+            # Check response type
+            if "type" not in response:
+                raise KeyError("Missing 'type' field in response")
+            
+            response_type = response["type"]
+            
+            if response_type == "tool_call":
+                # Validate tool call structure
+                if "tool" not in response or not isinstance(response["tool"], dict):
+                    raise KeyError("Missing or invalid 'tool' field in tool_call response")
+                
+                tool_name = response["tool"].get("name")
+                arguments = response["tool"].get("parameters", {})
+                
+                if not tool_name:
+                    raise KeyError("Missing 'name' in tool specification")
+                
+                # Self-check: Verify tool exists
+                if tool_name not in [t.name for t in self.tools]:
+                    raise ValueError(f"Unknown tool: {tool_name}")
+                
+                return tool_name, arguments
+            
+            elif response_type == "final_answer":
+                # Validate final answer structure
+                if "response" not in response:
+                    raise KeyError("Missing 'response' field in final_answer")
+                
+                return "FINAL_ANSWER", response["response"]
+            
+            else:
+                raise ValueError(f"Invalid response type: {response_type}")
+                
+        except Exception as e:
+            logger.error(f"Error parsing response: {str(e)}")
+            logger.error("Raw text: %s", repr(text))
             return None, None
-
-        tool_name = match.group(1)
-        args_str = match.group(2)
-
-        # Parse arguments
-        arguments = {}
-        if args_str:
-            for arg in args_str.split(','):
-                if '=' in arg:
-                    key, value = arg.split('=', 1)
-                    key = key.strip()
-                    value = value.strip()
-                    # Handle boolean values
-                    if value.lower() == 'true':
-                        value = True
-                    elif value.lower() == 'false':
-                        value = False
-                    # Handle numeric values
-                    elif value.isdigit():
-                        value = int(value)
-                    elif value.replace('.', '').isdigit() and value.count('.') == 1:
-                        value = float(value)
-                    arguments[key] = value
-
-        return tool_name, arguments
 
     async def process_request(self, user_request: str) -> str:
         """Process a user request using Gemini and MCP tools."""
@@ -133,50 +272,76 @@ class GeminiMCPAgent:
 
         self.iteration = 0
         self.iteration_response = []
+        #pdb.set_trace()
 
         while self.iteration < self.max_iterations:
             try:
-                print(f"\n--- Iteration {self.iteration + 1} ---")
+                logger.info(f"\n--- Iteration {self.iteration + 1} ---")
                 if self.iteration_response is None:
                     current_query = user_request
                 else:
                     current_query = user_request + "\n\n" + " ".join(self.iteration_response)
                     current_query = current_query + "  What should I do next?"
                 # Create prompt with context
-                print("Created system prompt...")
+                logger.info("Created system prompt...")
+                #pdb.set_trace()
                 
+                context = self.CONTEXT_PROMPT.format(tools_description="\n".join([
+                    f"- {desc}" for desc in self.tools_description
+                ]))
+                #pdb.set_trace()
 
                 
-                context = "\n".join([
-                    "You are a ai agent solving problems in iteration with access to these tools:",
-                    *[f"- {desc}" for desc in self.tools_description],
-                    "\nTo use a tool, respond with: TOOL:name(param1=value1, param2=value2)",
-                    "For final answers, start with: FINAL_ANSWER:",
-                    """ Important:
-- When a function returns multiple values, you need to process all of them
-- Only give FINAL_ANSWER when you have completed all necessary calculations
-- Do not repeat function calls with the same parameters""",
-                    f"\nPrevious actions: {'; '.join(self.iteration_response)}",
-                    f"\nUser Request: {current_query}"
-                ])
+                # Add history
+                if self.iteration_response:
+                    context += f"\n\nPrevious actions: {'; '.join(self.iteration_response)}"
+                context += f"\n\nUser Request: {current_query}"
 
-                print("current query prompt:\n", current_query)
-
+                logger.info("\nProcessing request: %s", current_query)
+                logger.info("\nSending context to LLM: %s", context)
+                #pdb.set_trace()
+                
                 # Generate response using Gemini
-                response = await generate_with_timeout(client, context)
-                response_text = response.text.strip()
+                try:
+                    logger.info("\nFull system prompt:")
+                    logger.info("=" * 80)
+                    logger.info(context)
+                    logger.info("=" * 80)
+                    
+                    response = await generate_with_timeout(client, context)
 
-                print("response:\n", response_text)
-
-                # Check if it's a final answer
-                final_answer_match = re.search(r'FINAL_ANSWER:\s*(.*?)(?:\n|$)', response_text)
-                if final_answer_match:
-                    return final_answer_match.group(1).strip()
-
-                # Parse and execute tool call
-                tool_name, arguments = self._parse_tool_call(response_text)
-                if tool_name:
+                    #pdb.set_trace()
+                    if not response:
+                        return "Failed to get response from LLM"
+                    
+                    # Get response text and debug
+                    text = response.text
+                    logger.info("\nRaw response object: %s", response)
+                    logger.info("\nRaw response text: %s", repr(text))
+                    
+                    if not text:
+                        return "Empty response from LLM"
+                    
+                    # Clean the text
+                    cleaned_text = text.strip()
+                    cleaned_text = re.sub(r'^```json\s*|\s*```$', '', cleaned_text, flags=re.MULTILINE)
+                    logger.info("\nCleaned text: %s", repr(cleaned_text))
+                    
+                    # Parse the response
+                    tool_name, arguments = self._parse_tool_call(cleaned_text)
+                    
+                    if not tool_name:
+                        return "Failed to parse response from LLM"
+                    
+                    if tool_name == "FINAL_ANSWER":
+                        return arguments  # arguments contains the final response in this case
+                    
                     try:
+                        # Find the matching tool
+                        tool = next((t for t in self.tools if t.name == tool_name), None)
+                        if not tool:
+                            return f"Unknown tool: {tool_name}"
+                            
                         result = await asyncio.wait_for(
                             self.session.call_tool(name=tool_name, arguments=arguments),
                             timeout=5.0
@@ -194,18 +359,19 @@ class GeminiMCPAgent:
                                 result_str = str(result.content)
                         else:
                             result_str = str(result)
-
+                        
                         # Record the action
                         self.iteration_response.append(
                             f"Called {tool_name} with {arguments}, got: {result_str}"
                         )
                     except Exception as e:
-                        print("Error calling tool:  ", str(e))
-                        self.iteration_response.append(f"Error calling {tool_name}: {str(e)}")
-                        return f"Error executing tool {tool_name}: {str(e)}"
-                else:
-                    return "I couldn't understand how to handle that request. Please try again."
-
+                        logger.error(f"Error calling tool: %s", e)
+                        self.iteration_response.append(f"Error calling {tool_name}: {e}")
+                        return f"Error executing tool {tool_name}: {e}"
+                except Exception as e:
+                    logger.error(f"Error in process_request: %s", e)
+                    return f"Error processing request: {e}"
+                
                 self.iteration += 1
             except Exception as e:
                 return f"Error processing request: {str(e)}"
@@ -215,9 +381,9 @@ class GeminiMCPAgent:
 async def main():
     # Initialize the agent
     agent = GeminiMCPAgent()
-    print("\n=== Gemini MCP Agent Chat Interface ===")
-    print("Type 'exit' or 'quit' to end the session")
-    print("Type 'help' to see available commands")
+    logger.info("\n=== Gemini MCP Agent Chat Interface ===")
+    logger.info("Type 'exit' or 'quit' to end the session")
+    logger.info("Type 'help' to see available commands")
     
     # Set up server parameters
     server_params = StdioServerParameters(
@@ -227,63 +393,63 @@ async def main():
     
     try:
         # Initialize agent and get tools
-        print("\nInitializing agent and connecting to MCP server...")
+        logger.info("\nInitializing agent and connecting to MCP server...")
         tools = await agent.initialize(server_params)
-        print("✓ Connected successfully!")
-        print(f"\nAvailable tools: {len(tools)} tools loaded")
+        logger.info("✓ Connected successfully!")
+        logger.info(f"\nAvailable tools: {len(tools)} tools loaded")
         
         # Main chat loop
         while True:
             try:
                 # Get user input
-                print("\n> ", end='', flush=True)
+                logger.info("\n> ")
                 user_input = await asyncio.get_event_loop().run_in_executor(None, input)
                 
                 # Check for exit commands
                 if user_input.lower() in ['exit', 'quit']:
-                    print("Goodbye!")
+                    logger.info("Goodbye!")
                     break
                 
                 # Handle help command
                 if user_input.lower() == 'help':
-                    print("\nAvailable commands:")
-                    print("  help  - Show this help message")
-                    print("  tools - List available tools")
-                    print("  exit  - Exit the chat")
-                    print("  quit  - Exit the chat")
-                    print("\nYou can also type any natural language request to use the tools.")
+                    logger.info("\nAvailable commands:")
+                    logger.info("  help  - Show this help message")
+                    logger.info("  tools - List available tools")
+                    logger.info("  exit  - Exit the chat")
+                    logger.info("  quit  - Exit the chat")
+                    logger.info("\nYou can also type any natural language request to use the tools.")
                     continue
                 
                 # Handle tools command
                 if user_input.lower() == 'tools':
-                    print("\nAvailable tools:")
+                    logger.info("\nAvailable tools:")
                     for tool in tools:
-                        print(f"  - {tool}")
+                        logger.info(f"  - {tool}")
                     continue
                 
                 # Process the request
                 if user_input.strip():
-                    print("\nProcessing request...")
+                    logger.info("\nProcessing request...")
                     response = await agent.process_request(user_input)
-                    print(f"\nResponse: {response}")
+                    logger.info(f"\nResponse: {response}")
             
             except KeyboardInterrupt:
-                print("\nUse 'exit' or 'quit' to end the session")
+                logger.info("\nUse 'exit' or 'quit' to end the session")
                 continue
             except Exception as e:
-                print(f"\nError: {str(e)}")
+                logger.error(f"\nError: {str(e)}")
                 continue
     
     except Exception as e:
-        print(f"\nFatal error: {str(e)}")
+        logger.error(f"\nFatal error: {str(e)}")
     finally:
         await agent.cleanup()
-        print("\nClosing session...")
+        logger.info("\nClosing session...")
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nSession terminated by user")
+        logger.info("\nSession terminated by user")
     except Exception as e:
-        print(f"\nFatal error: {str(e)}")
+        logger.error(f"\nFatal error: {str(e)}")

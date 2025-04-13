@@ -149,8 +149,8 @@ def open_pinta() -> bool:
     try:
         os.system('pinta &')  # Run Pinta in the background
 
-        time.sleep(0.5)
-        pyautogui.hotkey('alt', 'fn', 'f10')
+        time.sleep(2.5)
+        pyautogui.hotkey('fn', 'alt', 'f10')
         time.sleep(0.5)
 
         return True
